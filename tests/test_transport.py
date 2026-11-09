@@ -154,3 +154,143 @@ def test_http_app_exposes_healthz():
 
     assert response.status_code == 200
     assert response.text == "ok"
+
+
+@pytest.mark.parametrize("path", ["/mcp", "/mcp/", "/healthz", "/missing"])
+@pytest.mark.parametrize("method", ["GET", "POST", "DELETE", "OPTIONS"])
+@pytest.mark.parametrize(
+    "authorization", [None, "Bearer wrong", "Basic test-key", "Bearer"]
+)
+def test_http_auth_rejects_before_routing(path, method, authorization):
+    from starlette.testclient import TestClient
+
+    manager = MagicMock()
+    manager.handle_request = AsyncMock()
+    with patch.object(server_module, "settings", Settings(BEARER_KEY="test-key")):
+        app = server_module._build_http_app(manager)
+    headers = {"Authorization": authorization} if authorization else {}
+    with TestClient(app) as client:
+        response = client.request(method, path, headers=headers, follow_redirects=False)
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
+    assert "test-key" not in response.text
+    manager.handle_request.assert_not_awaited()
+
+
+def test_bearer_key_from_environment_is_redacted(monkeypatch):
+    monkeypatch.setenv("BEARER_KEY", "secret-from-env")
+    settings = Settings()
+    assert settings.BEARER_KEY.get_secret_value() == "secret-from-env"
+    assert "secret-from-env" not in repr(settings)
+    assert "secret-from-env" not in settings.model_dump_json()
+
+
+@pytest.mark.parametrize("key", [" ", "key with space", "key\n", "密钥"])
+def test_http_rejects_unusable_key(key):
+    with patch.object(server_module, "settings", Settings(BEARER_KEY=key)):
+        with pytest.raises(ValueError, match="BEARER_KEY"):
+            server_module._build_http_app(MagicMock())
+
+
+def test_http_rejects_duplicate_authorization_and_query_key():
+    from starlette.testclient import TestClient
+
+    with patch.object(server_module, "settings", Settings(BEARER_KEY="test-key")):
+        app = server_module._build_http_app(MagicMock())
+    with TestClient(app) as client:
+        assert client.get("/healthz?access_token=test-key").status_code == 401
+        assert (
+            client.get(
+                "/healthz",
+                headers=[
+                    ("Authorization", "Bearer test-key"),
+                    ("Authorization", "Bearer wrong"),
+                ],
+            ).status_code
+            == 401
+        )
+        assert (
+            client.get(
+                "/healthz",
+                headers={
+                    "Authorization": "bEaReR test-key",
+                },
+            ).status_code
+            == 200
+        )
+
+
+def test_authenticated_mcp_initialize_and_list_tools():
+    """Exercise real MCP sessions through the authentication middleware."""
+    from contextlib import asynccontextmanager
+    from starlette.testclient import TestClient
+    from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+
+    manager = StreamableHTTPSessionManager(app=server_module.server, json_response=True)
+    with patch.object(server_module, "settings", Settings(BEARER_KEY="test-key")):
+        app = server_module._build_http_app(manager)
+
+    @asynccontextmanager
+    async def lifespan(app):
+        async with manager.run():
+            yield
+
+    app.router.lifespan_context = lifespan
+    headers = {
+        "Authorization": "Bearer test-key",
+        "Accept": "application/json, text/event-stream",
+    }
+    with TestClient(app) as client:
+        response = client.post(
+            "/mcp/",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": {"name": "test", "version": "1"},
+                },
+            },
+        )
+        assert response.status_code == 200
+        assert "serverInfo" in response.json()["result"]
+        headers["Mcp-Session-Id"] = response.headers["mcp-session-id"]
+        response = client.post(
+            "/mcp/",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+            },
+        )
+        assert response.status_code == 202
+        response = client.post(
+            "/mcp/",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list",
+            },
+        )
+        assert response.status_code == 200
+        assert any(
+            t["name"] == "search_papers" for t in response.json()["result"]["tools"]
+        )
+        # An established session must not bypass per-request authentication.
+        del headers["Authorization"]
+        assert (
+            client.post(
+                "/mcp/",
+                headers=headers,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/list",
+                },
+            ).status_code
+            == 401
+        )

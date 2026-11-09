@@ -4,6 +4,7 @@ import sys
 from importlib import import_module
 from importlib.metadata import version, PackageNotFoundError
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import SecretStr
 from pathlib import Path
 import logging
 import requests
@@ -128,6 +129,7 @@ class Settings(BaseSettings):
     TRANSPORT: str = "stdio"
     HOST: str = "127.0.0.1"
     PORT: int = 8000
+    BEARER_KEY: SecretStr = SecretStr("")
     ALLOWED_HOSTS: str = ""
     ALLOWED_ORIGINS: str = ""
     SEMANTIC_SCHOLAR_API_KEY: str = ""

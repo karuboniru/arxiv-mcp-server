@@ -1,0 +1,251 @@
+name: Container image
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: container-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build and test (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install Podman
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes podman
+      - name: Build native image
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          podman build --format docker --platform "linux/$ARCH" \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --tag localhost/arxiv-mcp-server:ci .
+      - name: Smoke test the HTTP MCP server
+        run: |
+          podman run --detach --name arxiv-smoke \
+            --publish 127.0.0.1:8000:8000 --env BEARER_KEY=ci-smoke-key \
+            --volume arxiv-smoke-data:/data localhost/arxiv-mcp-server:ci
+          python3 - <<'PY'
+          import http.client
+          import json
+          import time
+          import urllib.error
+          import urllib.request
+
+          headers = {
+              "Authorization": "Bearer ci-smoke-key",
+              "Content-Type": "application/json",
+              "Accept": "application/json, text/event-stream",
+          }
+          opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+          def rpc(message):
+              request = urllib.request.Request(
+                  "http://127.0.0.1:8000/mcp/",
+                  data=json.dumps(message).encode(),
+                  headers=headers,
+                  method="POST",
+              )
+              with opener.open(request, timeout=10) as response:
+                  session = response.headers.get("Mcp-Session-Id")
+                  if session:
+                      headers["Mcp-Session-Id"] = session
+                  if response.status == 202:
+                      return None
+                  if response.headers.get("Content-Type", "").startswith("text/event-stream"):
+                      for line in response:
+                          if line.startswith(b"data:"):
+                              result = json.loads(line[5:])
+                              if result.get("id") == message.get("id"):
+                                  return result
+                      raise RuntimeError("MCP stream closed without a response")
+                  return json.load(response)
+
+          initialize = {
+              "jsonrpc": "2.0", "id": 1, "method": "initialize",
+              "params": {
+                  "protocolVersion": "2025-06-18", "capabilities": {},
+                  "clientInfo": {"name": "container-smoke", "version": "1"},
+              },
+          }
+          for attempt in range(60):
+              try:
+                  result = rpc(initialize)
+                  break
+              except (urllib.error.URLError, TimeoutError, ConnectionError,
+                      http.client.RemoteDisconnected):
+                  if attempt == 59:
+                      raise
+                  time.sleep(1)
+          assert result and "result" in result, result
+          headers["MCP-Protocol-Version"] = result["result"]["protocolVersion"]
+          rpc({"jsonrpc": "2.0", "method": "notifications/initialized"})
+          result = rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+          assert result and "result" in result, result
+          names = {tool["name"] for tool in result["result"]["tools"]}
+          assert {"search_papers", "download_paper", "read_paper"} <= names, names
+          with opener.open(urllib.request.Request(
+              "http://127.0.0.1:8000/healthz",
+              headers={"Authorization": "Bearer ci-smoke-key"},
+          ), timeout=10) as response:
+              assert response.status == 200 and response.read() == b"ok"
+          try:
+              opener.open("http://127.0.0.1:8000/healthz", timeout=10)
+          except urllib.error.HTTPError as error:
+              assert error.code == 401, error.code
+          else:
+              raise AssertionError("Unauthenticated health probe was accepted")
+          print("HTTP MCP smoke test passed:", ", ".join(sorted(names)))
+          PY
+      - name: Verify PDF conversion and nonroot persistent storage
+        run: |
+          podman healthcheck run arxiv-smoke
+          podman exec arxiv-smoke /app/.venv/bin/python -c \
+            "import os, pathlib, pymupdf, pymupdf4llm; from importlib.metadata import version; assert version('pymupdf-layout'); assert os.getuid() == 65532; assert not pathlib.Path('/bin/sh').exists(); pathlib.Path('/data/papers/smoke.txt').write_text('persistent'); doc = pymupdf.open(); page = doc.new_page(); page.insert_text((72, 72), 'PDF conversion smoke test'); assert 'PDF conversion smoke test' in pymupdf4llm.to_markdown(doc, show_progress=False)"
+          podman run --rm --entrypoint /app/.venv/bin/python \
+            --volume arxiv-smoke-data:/data localhost/arxiv-mcp-server:ci -c \
+            "from pathlib import Path; assert Path('/data/papers/smoke.txt').read_text() == 'persistent'"
+      - name: Container logs
+        if: always()
+        run: podman logs arxiv-smoke || true
+      - name: Remove smoke container
+        if: always()
+        run: |
+          podman rm --force arxiv-smoke || true
+          podman volume rm arxiv-smoke-data || true
+      - name: Save tested image
+        if: github.event_name != 'pull_request'
+        run: podman save --format docker-archive --output image.tar localhost/arxiv-mcp-server:ci
+      - uses: actions/upload-artifact@v7
+        if: github.event_name != 'pull_request'
+        with:
+          name: image-${{ matrix.arch }}
+          path: image.tar
+          compression-level: 0
+          retention-days: 1
+          overwrite: true
+          if-no-files-found: error
+
+  publish:
+    name: Publish (${{ matrix.arch }})
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: image-${{ matrix.arch }}
+      - name: Install Podman
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes podman
+      - name: Publish tested image with a unique architecture tag
+        env:
+          ARCH: ${{ matrix.arch }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          tag="build-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$ARCH"
+          printf '%s' "$GHCR_TOKEN" | podman login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          podman load --input image.tar
+          podman push --digestfile digest.txt localhost/arxiv-mcp-server:ci "docker://$image:$tag"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ matrix.arch }}
+          path: digest.txt
+          retention-days: 1
+          overwrite: true
+          if-no-files-found: error
+      - name: Log out of GHCR
+        if: always()
+        run: podman logout ghcr.io || true
+
+  manifest:
+    name: Publish multiarch manifest
+    needs: publish
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: digest-*
+          path: digests
+      - name: Install Podman
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes podman
+      - name: Assemble and publish manifest
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          printf '%s' "$GHCR_TOKEN" | podman login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          podman manifest create localhost/arxiv-mcp-server:multiarch
+          for arch in amd64 arm64; do
+            digest=$(cat "digests/digest-$arch/digest.txt")
+            [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+            podman manifest add localhost/arxiv-mcp-server:multiarch "docker://$image@$digest"
+          done
+          podman manifest inspect localhost/arxiv-mcp-server:multiarch > manifest.json
+          python3 - <<'PY'
+          import json
+          with open("manifest.json") as stream:
+              manifest = json.load(stream)
+          platforms = {(item["platform"]["os"], item["platform"]["architecture"])
+                       for item in manifest["manifests"]}
+          assert platforms == {("linux", "amd64"), ("linux", "arm64")}, platforms
+          PY
+          tags=("sha-$GITHUB_SHA" "build-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT")
+          if [[ "$GITHUB_REF" == refs/heads/main ]]; then
+            tags+=(latest)
+          elif [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9][A-Za-z0-9_.-]{0,126}$ ]]; then
+              echo 'Release tag must be a valid container tag beginning with v and a digit.' >&2
+              exit 1
+            fi
+            tags+=("$GITHUB_REF_NAME")
+          fi
+          for tag in "${tags[@]}"; do
+            podman manifest push --all localhost/arxiv-mcp-server:multiarch "docker://$image:$tag"
+            echo "Published $image:$tag" >> "$GITHUB_STEP_SUMMARY"
+          done
+      - name: Log out of GHCR
+        if: always()
+        run: podman logout ghcr.io || true

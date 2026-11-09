@@ -1,5 +1,9 @@
 .git
 .github
+.agents
+.codex
+.aws
+.ssh
 .venv
 venv
 __pycache__
@@ -11,6 +15,8 @@ htmlcov
 .ruff_cache
 .env
 .env.*
+*.pem
+*.key
 .mcpregistry_github_token
 .mcpregistry_registry_token
 build
@@ -21,3 +27,6 @@ mcpb-build
 papers
 downloads
 .DS_Store
+tests
+docs
+scripts

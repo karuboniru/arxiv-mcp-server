@@ -7,6 +7,7 @@ This module implements an MCP server for interacting with arXiv.
 
 import json
 import logging
+import secrets
 from typing import Any, Dict, List
 
 import mcp.types as types
@@ -17,6 +18,8 @@ from mcp.server.stdio import stdio_server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.types import ASGIApp, Receive, Scope, Send
 from starlette.responses import PlainTextResponse
 from starlette.routing import Mount, Route
 from .config import Settings, close_arxiv_client
@@ -239,13 +242,49 @@ async def _healthz(_request):
     return PlainTextResponse("ok")
 
 
+class BearerAuthMiddleware:
+    """Authenticate each HTTP request without buffering MCP streams."""
+
+    def __init__(self, app: ASGIApp, key: str):
+        self.app = app
+        self.key = key.encode("utf-8")
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send):
+        if scope["type"] == "http":
+            headers = [
+                value
+                for name, value in scope["headers"]
+                if name.lower() == b"authorization"
+            ]
+            parts = headers[0].split() if len(headers) == 1 else []
+            if not (
+                len(parts) == 2
+                and parts[0].lower() == b"bearer"
+                and secrets.compare_digest(parts[1], self.key)
+            ):
+                response = PlainTextResponse(
+                    "Unauthorized",
+                    status_code=401,
+                    headers={"WWW-Authenticate": "Bearer", "Cache-Control": "no-store"},
+                )
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
 def _build_http_app(session_manager) -> Starlette:
     """HTTP app: MCP mount plus a deploy probe. stdio does not use this."""
+    key = settings.BEARER_KEY.get_secret_value()
+    if key and (not key.isascii() or any(char.isspace() for char in key)):
+        raise ValueError(
+            "BEARER_KEY must contain only ASCII characters without whitespace"
+        )
     return Starlette(
+        middleware=[Middleware(BearerAuthMiddleware, key=key)] if key else [],
         routes=[
             Route("/healthz", _healthz, methods=["GET"]),
             Mount("/mcp", app=session_manager.handle_request),
-        ]
+        ],
     )
 
 

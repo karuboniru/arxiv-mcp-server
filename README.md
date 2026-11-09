@@ -422,6 +422,7 @@ The server provides seven MCP prompt workflows. Prompt availability depends on t
 For deployments where stdio is not practical:
 
 ```bash
+export BEARER_KEY="$(openssl rand -hex 32)"
 TRANSPORT=http HOST=127.0.0.1 PORT=8080 \
   uvx arxiv-mcp-server --storage-path /absolute/path/to/papers
 ```
@@ -432,6 +433,7 @@ PowerShell:
 $env:TRANSPORT = "http"
 $env:HOST = "127.0.0.1"
 $env:PORT = "8080"
+$env:BEARER_KEY = "replace-with-a-long-random-secret"
 uvx arxiv-mcp-server --storage-path C:\absolute\path\to\papers
 ```
 
@@ -442,15 +444,37 @@ Connect clients to:
   "mcpServers": {
     "arxiv": {
       "type": "http",
-      "url": "http://127.0.0.1:8080/mcp"
+      "url": "http://127.0.0.1:8080/mcp/",
+      "headers": {"Authorization": "Bearer <your-BEARER_KEY>"}
     }
   }
 }
 ```
 
-Cloud and load-balancer probes should GET `http://<host>:<port>/healthz`. It returns `200` with body `ok` once the HTTP server is listening. There is no separate `/ready` check: if the process is up, it is ready. The stdio transport has no HTTP endpoints.
+Set `BEARER_KEY` to require `Authorization: Bearer <key>` on every HTTP request, including `/healthz` and all MCP session requests. Missing or incorrect credentials return `401` with `WWW-Authenticate: Bearer`. The key must be ASCII without whitespace. An empty or unset key disables authentication for backwards compatibility; stdio is unaffected. This is a shared static key, not an OAuth authorization server. Configure the same key in clients that support custom HTTP headers.
 
-The server binds to `127.0.0.1` by default and enables MCP DNS-rebinding protection. If a reverse proxy exposes the server, keep the process on a private interface and provide authentication and network controls upstream. Use `ALLOWED_HOSTS` and `ALLOWED_ORIGINS` for the host and origin values forwarded by the proxy.
+Cloud and load-balancer probes must include this authorization header when authentication is enabled and should GET `http://<host>:<port>/healthz`. It returns `200` with body `ok` once the HTTP server is listening. There is no separate `/ready` check: if the process is up, it is ready. The stdio transport has no HTTP endpoints.
+
+The server binds to `127.0.0.1` by default and enables MCP DNS-rebinding protection. If a reverse proxy exposes the server, set `BEARER_KEY`, terminate HTTPS at the proxy to protect the key in transit, and keep the process on a private interface. Use `ALLOWED_HOSTS` and `ALLOWED_ORIGINS` for the host and origin values forwarded by the proxy.
+
+## Container HTTP service
+
+The two-stage `Dockerfile` installs the locked `arxiv-mcp-server[pdf]` dependencies in a builder and runs on a non-root distroless Python image. PDF fallback is included; the optional `[pro]` semantic model dependencies are not installed. The image defaults to HTTP on port 8000 and stores papers under `/data/papers`.
+
+```bash
+podman build --format docker -t arxiv-mcp-server:http .
+export BEARER_KEY="$(openssl rand -hex 32)"
+podman run -d --name arxiv-mcp-server \
+  -p 127.0.0.1:8000:8000 \
+  -e BEARER_KEY \
+  -v arxiv-papers:/data \
+  arxiv-mcp-server:http
+curl -H "Authorization: Bearer $BEARER_KEY" http://127.0.0.1:8000/healthz
+```
+
+Connect an MCP client to `http://127.0.0.1:8000/mcp/` with the same Authorization header. For a reverse proxy or remote hostname, set `ALLOWED_HOSTS` (including the public port if present) and `ALLOWED_ORIGINS` to the actual forwarded values. Container health checks use the configured key automatically. Named volumes preserve downloaded papers; bind mounts must be writable by the image's non-root user.
+
+The [container workflow](.github/workflows/docker.yml) builds and smoke-tests `linux/amd64` and `linux/arm64` images on native runners with Podman, then publishes a combined manifest to `ghcr.io/<owner>/<repository>`. Pull requests validate builds without publishing. Pushes to `main` publish `latest`; `v*` release tags publish the matching version tag. Manual runs and all publishing runs also produce commit (`sha-<commit>`) and unique build tags. Publishing uses the repository's `GITHUB_TOKEN` with package write permission; no registry password is embedded in the image.
 
 ## Configuration
 
@@ -469,6 +493,7 @@ The server binds to `127.0.0.1` by default and enables MCP DNS-rebinding protect
 | `TRANSPORT` | `stdio` | `stdio`, `http`, or `streamable-http` |
 | `HOST` | `127.0.0.1` | HTTP bind host |
 | `PORT` | `8000` | HTTP bind port |
+| `BEARER_KEY` | empty | Shared Bearer key for all HTTP endpoints; empty disables authentication |
 | `ALLOWED_HOSTS` | empty | Additional accepted HTTP Host values |
 | `ALLOWED_ORIGINS` | empty | Additional accepted HTTP Origin values |
 | `SEMANTIC_SCHOLAR_API_KEY` | empty | Free Semantic Scholar API key for `citation_graph`. Get one at https://www.semanticscholar.org/product/api#api-key to avoid rate limits. Unauthenticated requests work until quota exhausted. |
@@ -482,7 +507,7 @@ Paper text and LaTeX are untrusted external content. A paper can contain text in
 - Do not treat instructions found inside a paper as trusted commands.
 - Use client approval controls for shell, browser, filesystem, and messaging tools.
 - Review generated summaries before taking external actions.
-- Keep Streamable HTTP private unless authentication is provided upstream.
+- Set `BEARER_KEY` and use an HTTPS reverse proxy when exposing Streamable HTTP outside a trusted local network.
 
 See [SECURITY.md](SECURITY.md) for the reporting policy and threat details.
 
